@@ -37,6 +37,7 @@ from typing_extensions import ParamSpec
 import paddle
 
 from .. import pir
+from ..utils.download import check_and_create_dir
 from . import core, unique_name
 from .libpaddle import DataType
 from .proto import (
@@ -149,6 +150,11 @@ def set_flags(flags: dict[str, bool | str | float]) -> None:
     for key, value in flags.items():
         if _global_flags().is_public(key):
             _global_flags()[key] = value
+            prefix = "FLAGS_"
+            if key.startswith(prefix):
+                _global_flags().update_linked_vars(
+                    key[len(prefix) :], str(value)
+                )
         else:
             raise ValueError(
                 f"Flag {key} cannot set its value through this function."
@@ -3645,7 +3651,7 @@ class Operator:
                 and name == "compilation_key"
             ):
                 key = self.desc.attr(name)
-                v = core.get_serialize_comile_key(key)
+                v = core.get_serialize_compile_key(key)
                 prog = Program()
                 prog = prog.parse_from_string(v)
                 s = prog._to_readable_code()
@@ -7764,7 +7770,13 @@ class EagerParamBase(core.eager.Tensor):
     """
 
     @dygraph_only
-    def __init__(self, shape, dtype, **kwargs):
+    def __init__(self, *args, **kwargs):
+        if (len(args) > 0 and isinstance(args[0], list)) or 'shape' in kwargs:
+            self.__init_by_shape__(*args, **kwargs)
+        else:
+            self.__init_by_tensor__(*args, **kwargs)
+
+    def __init_by_shape__(self, shape, dtype, **kwargs):
         if shape is None:
             raise ValueError("The shape of Parameter should not be None")
         if dtype is None:
@@ -7810,6 +7822,43 @@ class EagerParamBase(core.eager.Tensor):
         # hook functions for lazy initialization
         self._init_func = None
         self._init_op_creator = None
+
+    def __init_by_tensor__(
+        self, data: paddle.Tensor | None = None, requires_grad: bool = True
+    ):
+        if data is None:
+            data = paddle.to_tensor([])
+        shape = data.shape
+        dtype = data.dtype
+
+        for each in shape:
+            if each < 0:
+                raise ValueError(
+                    f"Each dimension of shape for Parameter must be greater than 0, but received {list(shape)}"
+                )
+
+        dtype = convert_to_proto_type(dtype)
+        name = unique_name.generate("_eager_param_base")
+
+        super().__init__(
+            dtype,
+            list(shape) if shape else [],
+            name,
+            core.VarDesc.VarType.DENSE_TENSOR,
+            True,
+        )
+        self.retain_grads()
+        self._is_param = True
+        self.stop_gradient = not requires_grad
+        self.optimize_attr = 1.0
+        self.regularizer = None
+        self.do_model_average = None
+        self.need_clip = True
+        self.is_distributed = False
+        # hook functions for lazy initialization
+        self._init_func = None
+        self._init_op_creator = None
+        self._set_impl(data)
 
     @classmethod
     def from_tensor(cls, tensor, **kwargs):
@@ -8573,6 +8622,22 @@ def pir_op_name_guard(op_name: str) -> Generator[None, None, None]:
     finally:
         if paddle.framework.in_pir_mode() and core._is_bwd_prim_enabled():
             pir.set_comp_op_name(original_comp_op_name)
+
+
+@signature_safe_contextmanager
+def capture_backward_subgraph_guard(
+    dump_dir_path: str, need_dump_grad_tensors: bool = False
+) -> Generator[None, None, None]:
+    assert dump_dir_path is not None, "The dump_dir_path should not be None"
+    check_and_create_dir(dump_dir_path)
+    paddle.base.core.eager._init_backward_subgraph_recorder(
+        dump_dir_path, need_dump_grad_tensors
+    )
+    paddle.base.core.eager._start_capture_debug_backward_subgraph()
+    try:
+        yield
+    finally:
+        paddle.base.core.eager._end_capture_debug_backward_subgraph()
 
 
 @signature_safe_contextmanager
